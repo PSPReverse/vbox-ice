@@ -1,109 +1,8 @@
-Index: include/VBox/vmm/pdmiceifs.h
-===================================================================
---- include/VBox/vmm/pdmiceifs.h	(nicht existent)
-+++ include/VBox/vmm/pdmiceifs.h	(Arbeitskopie)
-@@ -0,0 +1,81 @@
-+/** @file
-+ * PDM - Pluggable Device Manager, In-Circuit emulator related interfaces.
-+ */
-+
-+/*
-+ * Copyright (C) 2020 Oracle Corporation
-+ *
-+ * This file is part of VirtualBox Open Source Edition (OSE), as
-+ * available from http://www.virtualbox.org. This file is free software;
-+ * you can redistribute it and/or modify it under the terms of the GNU
-+ * General Public License (GPL) as published by the Free Software
-+ * Foundation, in version 2 as it comes in the "COPYING" file of the
-+ * VirtualBox OSE distribution. VirtualBox OSE is distributed in the
-+ * hope that it will be useful, but WITHOUT ANY WARRANTY of any kind.
-+ *
-+ * The contents of this file may alternatively be used under the terms
-+ * of the Common Development and Distribution License Version 1.0
-+ * (CDDL) only, as it comes in the "COPYING.CDDL" file of the
-+ * VirtualBox OSE distribution, in which case the provisions of the
-+ * CDDL are applicable instead of those of the GPL.
-+ *
-+ * You may elect to license modified versions of this file under the
-+ * terms and conditions of either the GPL or the CDDL or both.
-+ */
-+
-+#ifndef VBOX_INCLUDED_vmm_pdmiceifs_h
-+#define VBOX_INCLUDED_vmm_pdmiceifs_h
-+#ifndef RT_WITHOUT_PRAGMA_ONCE
-+# pragma once
-+#endif
-+
-+#include <VBox/types.h>
-+
-+RT_C_DECLS_BEGIN
-+
-+/** @defgroup grp_pdm_ifs_ice       PDM In-Circuit emulator Interfaces
-+ * @ingroup grp_pdm_interfaces
-+ * @{
-+ */
-+
-+
-+/** Pointer to an ICE interface. */
-+typedef struct PDMIICE *PPDMIICE;
-+/**
-+ * ICE interface (down).
-+ */
-+typedef struct PDMIICE
-+{
-+    /**
-+     * Reads from the given I/O port.
-+     *
-+     * @returns VBox status code.
-+     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
-+     * @param   IoPort              The I/O port to read from.
-+     * @param   cb                  Access width in bytes.
-+     * @param   pu32                Where to store the read data.
-+     */
-+    DECLR3CALLBACKMEMBER(int, pfnIoPortRead, (PPDMIICE pInterface, RTIOPORT IoPort, size_t cb, uint32_t *pu32));
-+
-+
-+    /**
-+     * Writes to the given I/O port.
-+     *
-+     * @returns VBox status code.
-+     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
-+     * @param   IoPort              The I/O port to write to.
-+     * @param   cb                  Access width in bytes.
-+     * @param   u32                 The data to write.
-+     */
-+    DECLR3CALLBACKMEMBER(int, pfnIoPortWrite, (PPDMIICE pInterface, RTIOPORT IoPort, size_t cb, uint32_t u32));
-+
-+} PDMIICE;
-+/** PDMIICE interface ID. */
-+#define PDMIICE_IID                       "13abdd9a-f039-41dc-a720-48276083e4df"
-+
-+
-+/** @} */
-+
-+RT_C_DECLS_END
-+
-+#endif /* !VBOX_INCLUDED_vmm_pdmiceifs_h */
-
-Property changes on: include/VBox/vmm/pdmiceifs.h
-___________________________________________________________________
-Added: svn:eol-style
-## -0,0 +1 ##
-+native
-\ No newline at end of property
-Added: svn:keywords
-## -0,0 +1 ##
-+Author Date Id Revision
-\ No newline at end of property
-Added: svn:sync-process
-## -0,0 +1 ##
-+export
-\ No newline at end of property
 Index: src/VBox/Devices/Misc/DevIce.cpp
 ===================================================================
 --- src/VBox/Devices/Misc/DevIce.cpp	(nicht existent)
 +++ src/VBox/Devices/Misc/DevIce.cpp	(Arbeitskopie)
-@@ -0,0 +1,363 @@
+@@ -0,0 +1,413 @@
 +/* $Id$ */
 +/** @file
 + * ICE - In-Circuit Emulator device for hypervisor assisted x86 firmware development
@@ -250,6 +149,56 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +
 +
 +/**
++ * @interface_method_impl{PDMDEVREG,pfnMemSetup}
++ */
++static DECLCALLBACK(void) iceR3MemSetup(PPDMDEVINS pDevIns, PDMDEVMEMSETUPCTX enmCtx)
++{
++    RT_NOREF(enmCtx);
++    PICE pThis = PDMDEVINS_2_DATA(pDevIns, PICE);
++    PCPDMDEVHLPR3 pHlp = pDevIns->pHlpR3;
++
++    /*
++     * Check for any RAM ranges we have to sync.
++     */
++    PCFGMNODE pCfgmMemSync = pHlp->pfnCFGMGetChild(pDevIns->pCfg, "MemSync");
++    if (pCfgmMemSync)
++    {
++        int rc = VINF_SUCCESS;
++
++        for (PCFGMNODE pNd = pHlp->pfnCFGMGetFirstChild(pCfgmMemSync); pNd && RT_SUCCESS(rc); pNd = pHlp->pfnCFGMGetNextChild(pNd))
++        {
++            char szName[32];
++            rc = pHlp->pfnCFGMGetName(pNd, &szName[0], sizeof(szName));
++            AssertMsgRCReturnVoid(rc, ("Configuration error: Range name is too long (or something)! rc=%Rrc\n", rc));
++
++            RTGCPHYS GCPhysStart = NIL_RTGCPHYS;
++            rc = pHlp->pfnCFGMQueryU64(pNd, "PhysicalStart", &GCPhysStart);
++            AssertMsgRCReturnVoid(rc, ("Configuration error: Querying \"PhysicalStart\" failed! rc=%Rrc\n", rc));
++
++            uint32_t cbSync = 0;
++            rc = pHlp->pfnCFGMQueryU32(pNd, "Size", &cbSync);
++            AssertMsgRCReturnVoid(rc, ("Configuration error: Querying \"Size\" failed! rc=%Rrc\n", rc));
++
++            LogRel(("ICE: Syncing RAM range %RGp - %RGp (%zu bytes)\n", GCPhysStart, GCPhysStart + cbSync - 1, cbSync));
++
++            while (cbSync)
++            {
++                uint8_t abSync[_1K];
++                size_t cbThisSync = RT_MIN(cbSync, sizeof(abSync));
++
++                rc = pThis->pDrvIce->pfnMemRead(pThis->pDrvIce, GCPhysStart, PDMIICEMEMTYPE_RAM, cbThisSync, &abSync[0]);
++                AssertMsgRCReturnVoid(rc, ("Reading %zu bytes of memory at %RGp failed! rc=%Rrc\n", cbThisSync, GCPhysStart, rc));
++
++                PDMDevHlpPhysWrite(pDevIns, GCPhysStart, &abSync[0], cbThisSync);
++                GCPhysStart += cbThisSync;
++                cbSync      -= cbThisSync;
++            }
++        }
++    }
++}
++
++
++/**
 + * @interface_method_impl{PDMDEVREG,pfnDestruct}
 + */
 +static DECLCALLBACK(int) iceR3Destruct(PPDMDEVINS pDevIns)
@@ -285,7 +234,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +    PDMDEV_VALIDATE_CONFIG_RETURN(pDevIns,
 +                                  "RomImage|"
 +                                  "RomLoadAddr|"
-+                                  "MapTop64KBelow4GB", "");
++                                  "MapTop64KBelow4GB", "MemSync");
 +
 +    char *pszRomImg = NULL;
 +    int rc = pHlp->pfnCFGMQueryStringAlloc(pCfg, "RomImage", &pszRomImg);
@@ -418,7 +367,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +    /* .pfnConstruct = */           iceR3Construct,
 +    /* .pfnDestruct = */            iceR3Destruct,
 +    /* .pfnRelocate = */            NULL,
-+    /*  pfnIOCtl */                 NULL,
++    /* .pfnMemSetup = */            iceR3MemSetup,
 +    /* .pfnPowerOn = */             NULL,
 +    /* .pfnReset = */               NULL,
 +    /* .pfnSuspend = */             NULL,
@@ -486,7 +435,7 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 ===================================================================
 --- src/VBox/Devices/Misc/DrvSerialIce.cpp	(nicht existent)
 +++ src/VBox/Devices/Misc/DrvSerialIce.cpp	(Arbeitskopie)
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,707 @@
 +/* $Id$ */
 +/** @file
 + * Driver for the ICE device speaking the serialICE (https://serialice.com) protocol.
@@ -531,6 +480,34 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +/*********************************************************************************************************************************
 +*   Structures and Typedefs                                                                                                      *
 +*********************************************************************************************************************************/
++
++/**
++ * The header for the binary transfer mode.
++ */
++typedef struct SERIALICEBINHDR
++{
++    /** Flags for the transfer. */
++    uint32_t                        fFlags;
++    /** Size of the transfer in bytes. */
++    uint32_t                        cbXfer;
++    /** The start address */
++    uint64_t                        u64AddrStart;
++} SERIALICEBINHDR;
++/** Pointer to a binary transfer header. */
++typedef SERIALICEBINHDR *PSERIALICEBINHDR;
++/** Pointer to a const binary transfer header. */
++typedef const SERIALICEBINHDR *PCSERIALICEBINHDR;
++
++/** Indicates a write request, read if cleared. */
++#define SERIALICE_BIN_REQ_HDR_F_WRITE           RT_BIT(0)
++/** Indicates an I/O port access, memory access if clear. */
++#define SERIALICE_BIN_REQ_HDR_F_IOPORT          RT_BIT(1)
++/** Indicates a a RAM memory access, MMIO or unknown if clear. */
++#define SERIALICE_BIN_REQ_HDR_F_MEM_RAM         RT_BIT(2)
++/** Indicates a a MMIO memory access, RAM or unknown if clear. */
++#define SERIALICE_BIN_REQ_HDR_F_MEM_MMIO        RT_BIT(3)
++
++
 +/**
 + * SerialICE driver instance data.
 + *
@@ -547,6 +524,9 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +    char                        *pszLocation;
 +    /** Socket handle of the TCP socket connection. */
 +    RTSOCKET                    hTcpSock;
++
++    /** Flag whether the ICE target supports the extended protocol. */
++    bool                        fIceProtExtended;
 +
 +} DRVSERIALICE;
 +/** Pointer to a serialICE driver instance. */
@@ -580,6 +560,178 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +            return PDMDrvHlpVMSetError(pThis->pDrvIns, rc, RT_SRC_POS,
 +                                       N_("DrvSerialIce#%d to read data while waiting for readiness %s"),
 +                                       pThis->pDrvIns->iInstance, pThis->pszLocation);
++    }
++
++    return rc;
++}
++
++
++/**
++ * Legacy protocol memory read request handler.
++ *
++ * @returns VBox status code.
++ * @param   pThis                   The SerialICE driver instance.
++ * @param   GCPhysStart             The guest physical address to start reading from.
++ * @param   cbRead                  Number of bytes to read.
++ * @param   pvBuf                   Where to store the read data.
++ */
++static int drvSerialIceMemReadLegacy(PDRVSERIALICE pThis, RTGCPHYS GCPhysStart, size_t cbRead, void *pvBuf)
++{
++    int rc = VINF_SUCCESS;
++    uint8_t *pbCur = (uint8_t *)pvBuf;
++    uint8_t abMemRdCmd[3 + 8 + 2] = { '*', 'r', 'm', 0 };
++    while (   cbRead
++           && RT_SUCCESS(rc))
++    {
++        size_t cbThisRead = RT_MIN(cbRead, sizeof(uint32_t));
++        uint8_t *pbMemRdCmd = &abMemRdCmd[2];
++
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 28) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 24) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 20) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 16) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 12) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 8) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[(GCPhysStart >> 4) & 0xf];
++        *pbMemRdCmd++ = s_abHexToChr[GCPhysStart & 0xf];
++
++        /* Add the . and the size .*/
++        *pbMemRdCmd++ = '.';
++        switch (cbThisRead)
++        {
++            case 1:
++                *pbMemRdCmd++ = 'b';
++                break;
++            case 2:
++                *pbMemRdCmd++ = 'w';
++                break;
++            case 4:
++                *pbMemRdCmd++ = 'l';
++                break;
++            default:
++                AssertMsgFailed(("Invalid write size %zu\n", cbThisRead));
++        }
++
++        rc = RTTcpWrite(pThis->hTcpSock, &abMemRdCmd[0], pbMemRdCmd - &abMemRdCmd[0]);
++        if (RT_SUCCESS(rc))
++        {
++            /* Wait for the reply. */
++            for (;;)
++            {
++                /* Skipy any spaces and newlines which might still be in the buffer. */
++                uint8_t bRead = 0;
++                rc = RTTcpRead(pThis->hTcpSock, &bRead, sizeof(bRead), NULL /*pcbRead*/);
++                if (RT_SUCCESS(rc))
++                {
++                    if (   bRead == ' '
++                        || bRead == '\n'
++                        || bRead == '\r')
++                        continue;
++                    else
++                    {
++                        /* Read the remaining data, at most 8 bytes for a 32bit value. */
++                        char abRecv[9] = { 0 };
++                        abRecv[0] = bRead;
++
++                        rc = RTTcpRead(pThis->hTcpSock, &abRecv[1], (cbThisRead * 2) - 1, NULL /*pcbRead*/);
++                        if (RT_SUCCESS(rc))
++                        {
++                            //const char *pbData = &abRecv[(cbThisRead * 2) - 2];
++                            for (uint32_t i = 0; i < cbThisRead && RT_SUCCESS(rc); i++)
++                            {
++                                rc = RTStrConvertHexBytes(&abRecv[i*2] /*pbData*/, pbCur, 1, 0 /*fFlags*/);
++                                if (   rc == VWRN_TRAILING_CHARS
++                                    || rc == VERR_BUFFER_OVERFLOW)
++                                    rc = VINF_SUCCESS;
++
++                                //pbData -= 2;
++                                pbCur++;
++                            }
++                        }
++
++                        break;
++                    }
++                }
++                else
++                    break;
++            }
++
++            if (RT_SUCCESS(rc))
++                rc = drvSerialIceWaitForCmdReadiness(pThis);
++        }
++
++        GCPhysStart += cbThisRead;
++        cbRead      -= cbThisRead;
++    }
++
++    return rc;
++}
++
++
++/**
++ * Legacy protocol memory write request handler.
++ *
++ * @returns VBox status code.
++ * @param   pThis                   The SerialICE driver instance.
++ * @param   GCPhysStart             The guest physical address to start writing.
++ * @param   cbWrite                 Number of bytes to write.
++ * @param   pvBuf                   The data to write.
++ */
++static int drvSerialIceMemWriteLegacy(PDRVSERIALICE pThis, RTGCPHYS GCPhysStart, size_t cbWrite, const void *pvBuf)
++{
++    int rc = VINF_SUCCESS;
++    const uint8_t *pbCur = (const uint8_t *)pvBuf;
++    uint8_t abMemWrCmd[3 + 8 + 3 + 8] = { '*', 'w', 'm', 0 };
++
++    while (   cbWrite
++           && RT_SUCCESS(rc))
++    {
++        size_t cbThisWrite = RT_MIN(cbWrite, sizeof(uint32_t));
++        uint8_t *pbMemWrCmd = &abMemWrCmd[2];
++
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 28) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 24) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 20) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 16) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 12) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 8) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[(GCPhysStart >> 4) & 0xf];
++        *pbMemWrCmd++ = s_abHexToChr[GCPhysStart & 0xf];
++
++        /* Add the . and the size .*/
++        *pbMemWrCmd++ = '.';
++        switch (cbThisWrite)
++        {
++            case 1:
++                *pbMemWrCmd++ = 'b';
++                break;
++            case 2:
++                *pbMemWrCmd++ = 'w';
++                break;
++            case 4:
++                *pbMemWrCmd++ = 'l';
++                break;
++            default:
++                AssertMsgFailed(("Invalid write size %zu\n", cbThisWrite));
++        }
++
++        /* Encode the data to write. */
++        *pbMemWrCmd++ = '=';
++
++        uint8_t *pbData = pbMemWrCmd + (cbThisWrite * 2) - 1;
++        for (uint32_t i = 0; i < cbThisWrite; i++)
++        {
++            *pbData-- = s_abHexToChr[*pbCur & 0xf];
++            *pbData-- = s_abHexToChr[(*pbCur >> 4) & 0xf];
++            pbCur++;
++        }
++
++        rc = RTTcpWrite(pThis->hTcpSock, &abMemWrCmd[0], pbMemWrCmd - &abMemWrCmd[0]);
++        if (RT_SUCCESS(rc))
++            rc = drvSerialIceWaitForCmdReadiness(pThis);
++
++        GCPhysStart += cbThisWrite;
++        cbWrite     -= cbThisWrite;
 +    }
 +
 +    return rc;
@@ -662,7 +814,19 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +                    rc = RTTcpRead(pThis->hTcpSock, &abRecv[1], cbRecv, NULL /*pcbRead*/);
 +                    if (RT_SUCCESS(rc))
 +                    {
-+                        rc = RTStrConvertHexBytes(&abRecv[0], pu32, cb, 0 /*fFlags*/);
++                        const char *pbData = &abRecv[(cb * 2) - 2];
++                        for (uint32_t i = 0; i < cb && RT_SUCCESS(rc); i++)
++                        {
++                            uint8_t bVal = 0;
++                            rc = RTStrConvertHexBytes(pbData, &bVal, 1, 0 /*fFlags*/);
++                            if (rc == VWRN_TRAILING_CHARS)
++                                rc = VINF_SUCCESS;
++
++                            *pu32 <<= 8;
++                            *pu32 |= bVal;
++                            pbData -= 2;
++                        }
++
 +                        if (RT_SUCCESS(rc))
 +                            rc = drvSerialIceWaitForCmdReadiness(pThis);
 +                    }
@@ -729,6 +893,78 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +
 +
 +/**
++ * @interface_method_impl{PDMIICE,pfnMemRead}
++ */
++static DECLCALLBACK(int) drvSerialIceMemRead(PPDMIICE pInterface, RTGCPHYS GCPhysStart, PDMIICEMEMTYPE enmMemType,
++                                             size_t cbRead, void *pvBuf)
++{
++    LogFlowFunc(("pInterface=%#p\n", pInterface));
++    PDRVSERIALICE pThis = RT_FROM_MEMBER(pInterface, DRVSERIALICE, IIce);
++
++    if (!pThis->fIceProtExtended)
++        return drvSerialIceMemReadLegacy(pThis, GCPhysStart, cbRead, pvBuf);
++
++    int rc = VINF_SUCCESS;
++    SERIALICEBINHDR ReqHdr;
++
++    ReqHdr.fFlags       = 0;
++    ReqHdr.cbXfer       = (uint32_t)cbRead;
++    ReqHdr.u64AddrStart = GCPhysStart;
++    if (enmMemType == PDMIICEMEMTYPE_RAM)
++        ReqHdr.fFlags |= SERIALICE_BIN_REQ_HDR_F_MEM_RAM;
++    else if (enmMemType == PDMIICEMEMTYPE_MMIO)
++        ReqHdr.fFlags |= SERIALICE_BIN_REQ_HDR_F_MEM_MMIO;
++
++    uint8_t bBinReq = '!';
++    rc = RTTcpWrite(pThis->hTcpSock, &bBinReq, sizeof(bBinReq));
++    if (RT_SUCCESS(rc))
++        rc = RTTcpWrite(pThis->hTcpSock, &ReqHdr, sizeof(ReqHdr));
++    if (RT_SUCCESS(rc))
++        rc = RTTcpRead(pThis->hTcpSock, pvBuf, cbRead, NULL /*pcbRead*/);
++    if (RT_SUCCESS(rc))
++        rc = drvSerialIceWaitForCmdReadiness(pThis);
++
++    return rc;
++}
++
++
++/**
++ * @interface_method_impl{PDMIICE,pfnMemWrite}
++ */
++static DECLCALLBACK(int) drvSerialIceMemWrite(PPDMIICE pInterface, RTGCPHYS GCPhysStart, PDMIICEMEMTYPE enmMemType,
++                                              size_t cbWrite, const void *pvBuf)
++{
++    LogFlowFunc(("pInterface=%#p\n", pInterface));
++    PDRVSERIALICE pThis = RT_FROM_MEMBER(pInterface, DRVSERIALICE, IIce);
++
++    if (!pThis->fIceProtExtended)
++        return drvSerialIceMemWriteLegacy(pThis, GCPhysStart, cbWrite, pvBuf);
++
++    int rc = VINF_SUCCESS;
++    SERIALICEBINHDR ReqHdr;
++
++    ReqHdr.fFlags       = SERIALICE_BIN_REQ_HDR_F_WRITE;
++    ReqHdr.cbXfer       = (uint32_t)cbWrite;
++    ReqHdr.u64AddrStart = GCPhysStart;
++    if (enmMemType == PDMIICEMEMTYPE_RAM)
++        ReqHdr.fFlags |= SERIALICE_BIN_REQ_HDR_F_MEM_RAM;
++    else if (enmMemType == PDMIICEMEMTYPE_MMIO)
++        ReqHdr.fFlags |= SERIALICE_BIN_REQ_HDR_F_MEM_MMIO;
++
++    uint8_t bBinReq = '!';
++    rc = RTTcpWrite(pThis->hTcpSock, &bBinReq, sizeof(bBinReq));
++    if (RT_SUCCESS(rc))
++        rc = RTTcpWrite(pThis->hTcpSock, &ReqHdr, sizeof(ReqHdr));
++    if (RT_SUCCESS(rc))
++        rc = RTTcpWrite(pThis->hTcpSock, pvBuf, cbWrite);
++    if (RT_SUCCESS(rc))
++        rc = drvSerialIceWaitForCmdReadiness(pThis);
++
++    return rc;
++}
++
++
++/**
 + * Destruct a TCP socket stream driver instance.
 + *
 + * Most VM resources are freed by the VM. This callback is provided so that
@@ -774,11 +1010,14 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +     * Init basic data members and interfaces.
 +     */
 +    pThis->pDrvIns                               = pDrvIns;
++    pThis->fIceProtExtended                      = false;
 +    /* IBase. */
 +    pDrvIns->IBase.pfnQueryInterface             = drvSerialIceQueryInterface;
 +    /* IIce. */
 +    pThis->IIce.pfnIoPortRead                    = drvSerialIceIoPortRead;
 +    pThis->IIce.pfnIoPortWrite                   = drvSerialIceIoPortWrite;
++    pThis->IIce.pfnMemRead                       = drvSerialIceMemRead;
++    pThis->IIce.pfnMemWrite                      = drvSerialIceMemWrite;
 +
 +    /*
 +     * Validate and read the configuration.
@@ -815,6 +1054,40 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +
 +    /* Read the version string and wait for the > indicating readiness for receiving commands. */
 +    rc = drvSerialIceWaitForCmdReadiness(pThis);
++    if (RT_SUCCESS(rc))
++    {
++        /* Check whether the target supports the extended protocol. */
++        uint8_t bQueryExtended = '?';
++
++        rc = RTTcpWrite(pThis->hTcpSock, &bQueryExtended, sizeof(bQueryExtended));
++        if (RT_SUCCESS(rc))
++        {
++            for (;;)
++            {
++                /* Skipy any spaces and newlines which might still be in the buffer. */
++                uint8_t bRead = 0;
++                rc = RTTcpRead(pThis->hTcpSock, &bRead, sizeof(bRead), NULL /*pcbRead*/);
++                if (RT_SUCCESS(rc))
++                {
++                    if (   bRead == ' '
++                        || bRead == '\n'
++                        || bRead == '\r')
++                        continue;
++                    else if (bRead == '1')
++                    {
++                        pThis->fIceProtExtended = true;
++                        rc = drvSerialIceWaitForCmdReadiness(pThis);
++                    }
++                    else if (bRead != '>')
++                        rc = drvSerialIceWaitForCmdReadiness(pThis);
++
++                    break;
++                }
++                else
++                    break;
++            }
++        }
++    }
 +
 +    return rc;
 +}
@@ -887,7 +1160,7 @@ Added: svn:sync-process
 \ No newline at end of property
 Index: src/VBox/Devices/build/VBoxDD.cpp
 ===================================================================
---- src/VBox/Devices/build/VBoxDD.cpp	(Revision 139443)
+--- src/VBox/Devices/build/VBoxDD.cpp	(Revision 139516)
 +++ src/VBox/Devices/build/VBoxDD.cpp	(Arbeitskopie)
 @@ -220,6 +220,9 @@
      if (RT_FAILURE(rc))
@@ -911,7 +1184,7 @@ Index: src/VBox/Devices/build/VBoxDD.cpp
  }
 Index: src/VBox/Devices/build/VBoxDD.h
 ===================================================================
---- src/VBox/Devices/build/VBoxDD.h	(Revision 139443)
+--- src/VBox/Devices/build/VBoxDD.h	(Revision 139516)
 +++ src/VBox/Devices/build/VBoxDD.h	(Arbeitskopie)
 @@ -105,6 +105,7 @@
  #ifdef VBOX_WITH_VIRTUALKD
@@ -929,25 +1202,202 @@ Index: src/VBox/Devices/build/VBoxDD.h
  
  /* VBoxAcpi.cpp */
  int acpiPrepareDsdt(PPDMDEVINS pDevIns, void **ppvPtr, size_t *pcbDsdt);
-Index: src/VBox/Devices/Makefile.kmk
+Index: src/VBox/VMM/VMMR3/PDMDevice.cpp
 ===================================================================
---- src/VBox/Devices/Makefile.kmk	(Revision 139443)
-+++ src/VBox/Devices/Makefile.kmk	(Arbeitskopie)
-@@ -183,6 +183,7 @@
- 	\
-  	Input/DrvKeyboardQueue.cpp \
-  	Input/DrvMouseQueue.cpp \
-+ 	Misc/DevIce.cpp \
-  	Network/DrvIntNet.cpp \
-  	Network/DrvDedicatedNic.cpp \
-  	PC/DrvACPI.cpp \
-@@ -202,7 +203,8 @@
-  	Network/DrvNetSniffer.cpp \
-  	Network/Pcap.cpp \
-  	Trace/DrvIfsTrace.cpp \
-- 	Trace/DrvIfsTrace-serial.cpp
-+ 	Trace/DrvIfsTrace-serial.cpp \
-+ 	Misc/DrvSerialIce.cpp
-  ifn1of ($(KBUILD_TARGET), os2)
-   VBoxDD_SOURCES += Storage/DrvHostBase.cpp
-  endif
+--- src/VBox/VMM/VMMR3/PDMDevice.cpp	(Revision 139516)
++++ src/VBox/VMM/VMMR3/PDMDevice.cpp	(Arbeitskopie)
+@@ -144,8 +144,13 @@
+      *
+      */
+     /* Switch to /Devices, which contains the device instantiations. */
++    PCFGMNODE pPdmNode = CFGMR3GetChild(CFGMR3GetRoot(pVM), "PDM");
+     PCFGMNODE pDevicesNode = CFGMR3GetChild(CFGMR3GetRoot(pVM), "Devices");
++    char *pszDevExclude = NULL;
+ 
++    rc = CFGMR3QueryStringAllocDef(pPdmNode, "IgnoreAllDevicesExcept", &pszDevExclude, NULL);
++    AssertMsgRCReturn(rc, ("Configuration error: Failed to query \"IgnoreAllDevicesExcept\" with %Rrc\n"), rc);
++
+     /*
+      * Count the device instances.
+      */
+@@ -153,8 +158,22 @@
+     PCFGMNODE pInstanceNode;
+     unsigned cDevs = 0;
+     for (pCur = CFGMR3GetFirstChild(pDevicesNode); pCur; pCur = CFGMR3GetNextChild(pCur))
++    {
++        /* Check whether the device is exempted from exclusion. */
++        if (pszDevExclude)
++        {
++            char szName[32];
++            rc = CFGMR3GetName(pCur, &szName[0], sizeof(szName));
++            AssertMsgRCReturn(rc, ("Configuration error: device name is too long (or something)! rc=%Rrc\n", rc), rc);
++
++            if (!RTStrStr(pszDevExclude, &szName[0]))
++                continue; /* Device gets ignored. */
++        }
++
+         for (pInstanceNode = CFGMR3GetFirstChild(pCur); pInstanceNode; pInstanceNode = CFGMR3GetNextChild(pInstanceNode))
+             cDevs++;
++    }
++
+     if (!cDevs)
+     {
+         Log(("PDM: No devices were configured!\n"));
+@@ -185,6 +204,10 @@
+         rc = CFGMR3GetName(pCur, szName, sizeof(szName));
+         AssertMsgRCReturn(rc, ("Configuration error: device name is too long (or something)! rc=%Rrc\n", rc), rc);
+ 
++        if (   pszDevExclude
++            && !RTStrStr(pszDevExclude, &szName[0]))
++            continue; /* Device gets ignored. */
++
+         /* Find the device. */
+         PPDMDEV pDev = pdmR3DevLookup(pVM, szName);
+         AssertLogRelMsgReturn(pDev, ("Configuration error: device '%s' not found!\n", szName), VERR_PDM_DEVICE_NOT_FOUND);
+Index: include/VBox/vmm/pdmiceifs.h
+===================================================================
+--- include/VBox/vmm/pdmiceifs.h	(nicht existent)
++++ include/VBox/vmm/pdmiceifs.h	(Arbeitskopie)
+@@ -0,0 +1,127 @@
++/** @file
++ * PDM - Pluggable Device Manager, In-Circuit emulator related interfaces.
++ */
++
++/*
++ * Copyright (C) 2020 Oracle Corporation
++ *
++ * This file is part of VirtualBox Open Source Edition (OSE), as
++ * available from http://www.virtualbox.org. This file is free software;
++ * you can redistribute it and/or modify it under the terms of the GNU
++ * General Public License (GPL) as published by the Free Software
++ * Foundation, in version 2 as it comes in the "COPYING" file of the
++ * VirtualBox OSE distribution. VirtualBox OSE is distributed in the
++ * hope that it will be useful, but WITHOUT ANY WARRANTY of any kind.
++ *
++ * The contents of this file may alternatively be used under the terms
++ * of the Common Development and Distribution License Version 1.0
++ * (CDDL) only, as it comes in the "COPYING.CDDL" file of the
++ * VirtualBox OSE distribution, in which case the provisions of the
++ * CDDL are applicable instead of those of the GPL.
++ *
++ * You may elect to license modified versions of this file under the
++ * terms and conditions of either the GPL or the CDDL or both.
++ */
++
++#ifndef VBOX_INCLUDED_vmm_pdmiceifs_h
++#define VBOX_INCLUDED_vmm_pdmiceifs_h
++#ifndef RT_WITHOUT_PRAGMA_ONCE
++# pragma once
++#endif
++
++#include <VBox/types.h>
++
++RT_C_DECLS_BEGIN
++
++/** @defgroup grp_pdm_ifs_ice       PDM In-Circuit emulator Interfaces
++ * @ingroup grp_pdm_interfaces
++ * @{
++ */
++
++
++/**
++ * The memory type.
++ */
++typedef enum PDMIICEMEMTYPE
++{
++    /** Invalid memory type. */
++    PDMIICEMEMTYPE_INVALID = 0,
++    /** RAM type. */
++    PDMIICEMEMTYPE_RAM,
++    /** MMIO type. */
++    PDMIICEMEMTYPE_MMIO,
++    /** Unknown memory type, some guesses have to be made which might fail. */
++    PDMIICEMEMTYPE_UNKNONWN,
++    /** 32bit hack. */
++    PDMIICEMEMTYPE_32BIT_HACK = 0x7fffffff
++} PDMIICEMEMTYPE;
++
++
++/** Pointer to an ICE interface. */
++typedef struct PDMIICE *PPDMIICE;
++/**
++ * ICE interface (down).
++ */
++typedef struct PDMIICE
++{
++    /**
++     * Reads from the given I/O port.
++     *
++     * @returns VBox status code.
++     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
++     * @param   IoPort              The I/O port to read from.
++     * @param   cb                  Access width in bytes.
++     * @param   pu32                Where to store the read data.
++     */
++    DECLR3CALLBACKMEMBER(int, pfnIoPortRead, (PPDMIICE pInterface, RTIOPORT IoPort, size_t cb, uint32_t *pu32));
++
++
++    /**
++     * Writes to the given I/O port.
++     *
++     * @returns VBox status code.
++     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
++     * @param   IoPort              The I/O port to write to.
++     * @param   cb                  Access width in bytes.
++     * @param   u32                 The data to write.
++     */
++    DECLR3CALLBACKMEMBER(int, pfnIoPortWrite, (PPDMIICE pInterface, RTIOPORT IoPort, size_t cb, uint32_t u32));
++
++
++    /**
++     * Reads the given amount of memory starting from the given guest physical address.
++     *
++     * @returns VBox status code.
++     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
++     * @param   GCPhysStart         The guest physical address to start reading from.
++     * @param   enmMemType          The accessed memory type.
++     * @param   cbRead              Number of bytes to read.
++     * @param   pvBuf               Where to store the read data.
++     */
++    DECLR3CALLBACKMEMBER(int, pfnMemRead, (PPDMIICE pInterface, RTGCPHYS GCPhysStart, PDMIICEMEMTYPE enmMemType,
++                                           size_t cbRead, void *pvBuf));
++
++
++    /**
++     * Writes the given amount of memory starting from the given guest physical address.
++     *
++     * @returns VBox status code.
++     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
++     * @param   GCPhysStart         The guest physical address to start writing to.
++     * @param   enmMemType          The accessed memory type.
++     * @param   cbWrite             Number of bytes to write.
++     * @param   pvBuf               The data to write.
++     */
++    DECLR3CALLBACKMEMBER(int, pfnMemWrite, (PPDMIICE pInterface, RTGCPHYS GCPhysStart, PDMIICEMEMTYPE enmMemType,
++                                            size_t cbWrite, const void *pvBuf));
++
++} PDMIICE;
++/** PDMIICE interface ID. */
++#define PDMIICE_IID                       "13abdd9a-f039-41dc-a720-48276083e4df"
++
++
++/** @} */
++
++RT_C_DECLS_END
++
++#endif /* !VBOX_INCLUDED_vmm_pdmiceifs_h */
+
+Property changes on: include/VBox/vmm/pdmiceifs.h
+___________________________________________________________________
+Added: svn:eol-style
+## -0,0 +1 ##
++native
+\ No newline at end of property
+Added: svn:keywords
+## -0,0 +1 ##
++Author Date Id Revision
+\ No newline at end of property
+Added: svn:sync-process
+## -0,0 +1 ##
++export
+\ No newline at end of property
