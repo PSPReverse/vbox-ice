@@ -149,7 +149,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 ===================================================================
 --- src/VBox/Devices/Misc/DevIce.cpp	(nicht existent)
 +++ src/VBox/Devices/Misc/DevIce.cpp	(Arbeitskopie)
-@@ -0,0 +1,533 @@
+@@ -0,0 +1,562 @@
 +/* $Id$ */
 +/** @file
 + * ICE - In-Circuit Emulator device for hypervisor assisted x86 firmware development
@@ -252,6 +252,8 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +    uint8_t                         *pu8RomFree;
 +    /** The size of the system ROM. */
 +    size_t                          cbRom;
++    /** Where the ROM is initially loaded. */
++    RTGCPHYS                        GCPhysRom;
 +    /** Head of list of MMIO mappings. */
 +    RTLISTANCHOR                    LstMmio;
 +
@@ -372,6 +374,33 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +    PICE pThis = PDMDEVINS_2_DATA(pDevIns, PICE);
 +    PCPDMDEVHLPR3 pHlp = pDevIns->pHlpR3;
 +
++    uint32_t    cPages = RT_ALIGN_64(pThis->cbRom, PAGE_SIZE) >> PAGE_SHIFT;
++    RTGCPHYS    GCPhys = pThis->GCPhysRom;
++    while (cPages > 0)
++    {
++        uint8_t abPage[PAGE_SIZE];
++
++        /* Read the (original) ROM page and write it back to the RAM page. */
++        int rc = PDMDevHlpROMProtectShadow(pDevIns, GCPhys, PAGE_SIZE, PGMROMPROT_READ_ROM_WRITE_RAM);
++        AssertLogRelRC(rc);
++
++        rc = PDMDevHlpPhysRead(pDevIns, GCPhys, abPage, PAGE_SIZE);
++        AssertLogRelRC(rc);
++        if (RT_FAILURE(rc))
++            memset(abPage, 0xcc, sizeof(abPage));
++
++        rc = PDMDevHlpPhysWrite(pDevIns, GCPhys, abPage, PAGE_SIZE);
++        AssertLogRelRC(rc);
++
++        /* Switch to the RAM/RAM mode. */
++        rc = PDMDevHlpROMProtectShadow(pDevIns, GCPhys, PAGE_SIZE, PGMROMPROT_READ_RAM_WRITE_RAM);
++        AssertLogRelRC(rc);
++
++        /* Advance */
++        GCPhys += PAGE_SIZE;
++        cPages--;
++    }
++
 +    /* Syncing makes only sense if there is a driver. */
 +    if (pThis->pDrvIce)
 +    {
@@ -455,8 +484,9 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +    PDMDEV_VALIDATE_CONFIG_RETURN(pDevIns,
 +                                  "RomImage|"
 +                                  "RomLoadAddr|"
-+                                  "MapBelow4GB",
-+                                  "MemSync|MmioRanges");
++                                  "MapBelow4GB|",
++                                  "MemSync|"
++                                  "MmioRanges");
 +
 +    char *pszRomImg = NULL;
 +    int rc = pHlp->pfnCFGMQueryStringAlloc(pCfg, "RomImage", &pszRomImg);
@@ -469,8 +499,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +            return PDMDEV_SET_ERROR(pDevIns, rc,
 +                                    N_("Configuration error: Querying \"MapTop64KBelow4GB\" failed"));
 +
-+        RTGCPHYS GCPhysLoadAddr;
-+        rc = pHlp->pfnCFGMQueryU64(pCfg, "RomLoadAddr", &GCPhysLoadAddr);
++        rc = pHlp->pfnCFGMQueryU64(pCfg, "RomLoadAddr", &pThis->GCPhysRom);
 +        if (RT_SUCCESS(rc))
 +        {
 +            void   *pvFile;
@@ -490,11 +519,11 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +            pThis->cbRom  = cbFile;
 +
 +            /* Register the ROM image. */
-+            rc = PDMDevHlpROMRegister(pDevIns, GCPhysLoadAddr, pThis->cbRom, pThis->pu8Rom, pThis->cbRom,
-+                                      PGMPHYS_ROM_FLAGS_PERMANENT_BINARY, "ICERomImg");
++            rc = PDMDevHlpROMRegister(pDevIns, pThis->GCPhysRom, pThis->cbRom, pThis->pu8Rom, pThis->cbRom,
++                                      PGMPHYS_ROM_FLAGS_SHADOWED | PGMPHYS_ROM_FLAGS_PERMANENT_BINARY, "ICERomImg");
 +            AssertRCReturn(rc, rc);
 +
-+            rc = PDMDevHlpROMProtectShadow(pDevIns, GCPhysLoadAddr, (uint32_t)pThis->cbRom, PGMROMPROT_READ_RAM_WRITE_RAM);
++            rc = PDMDevHlpROMProtectShadow(pDevIns, pThis->GCPhysRom, (uint32_t)pThis->cbRom, PGMROMPROT_READ_RAM_WRITE_RAM);
 +            AssertRCReturn(rc, rc);
 +
 +            if (fMapBelow4GB)
@@ -504,7 +533,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +                                          PGMPHYS_ROM_FLAGS_PERMANENT_BINARY, "ICERomImgTop");
 +                AssertRCReturn(rc, rc);
 +
-+                rc = PDMDevHlpROMProtectShadow(pDevIns, GCPhysLoadAddr, (uint32_t)pThis->cbRom, PGMROMPROT_READ_RAM_WRITE_IGNORE);
++                rc = PDMDevHlpROMProtectShadow(pDevIns, _4G - pThis->cbRom, (uint32_t)pThis->cbRom, PGMROMPROT_READ_RAM_WRITE_IGNORE);
 +                AssertRCReturn(rc, rc);
 +            }
 +        }
