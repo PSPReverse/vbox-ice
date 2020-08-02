@@ -2,7 +2,7 @@ Index: include/VBox/vmm/pdmiceifs.h
 ===================================================================
 --- include/VBox/vmm/pdmiceifs.h	(nicht existent)
 +++ include/VBox/vmm/pdmiceifs.h	(Arbeitskopie)
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,149 @@
 +/** @file
 + * PDM - Pluggable Device Manager, In-Circuit emulator related interfaces.
 + */
@@ -120,6 +120,28 @@ Index: include/VBox/vmm/pdmiceifs.h
 +    DECLR3CALLBACKMEMBER(int, pfnMemWrite, (PPDMIICE pInterface, RTGCPHYS GCPhysStart, PDMIICEMEMTYPE enmMemType,
 +                                            size_t cbWrite, const void *pvBuf));
 +
++
++    /**
++     * Reads the given MSR.
++     *
++     * @returns VBox status code.
++     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
++     * @param   idMsr               The MSR to read.
++     * @param   pu64Val             Where to store the read value upon success.
++     */
++    DECLR3CALLBACKMEMBER(int, pfnMsrRead, (PPDMIICE pInterface, uint32_t idMsr, uint64_t *pu64Val));
++
++
++    /**
++     * Writes the given MSR.
++     *
++     * @returns VBox status code.
++     * @param   pInterface          Pointer to the interface structure containing the called function pointer.
++     * @param   idMsr               The MSR to write.
++     * @param   u64Val              The value to write.
++     */
++    DECLR3CALLBACKMEMBER(int, pfnMsrWrite, (PPDMIICE pInterface, uint32_t idMsr, uint64_t u64Val));
++
 +} PDMIICE;
 +/** PDMIICE interface ID. */
 +#define PDMIICE_IID                       "13abdd9a-f039-41dc-a720-48276083e4df"
@@ -145,11 +167,55 @@ Added: svn:sync-process
 ## -0,0 +1 ##
 +export
 \ No newline at end of property
+Index: include/VBox/vmm/cpum.h
+===================================================================
+--- include/VBox/vmm/cpum.h	(Revision 139592)
++++ include/VBox/vmm/cpum.h	(Arbeitskopie)
+@@ -2647,6 +2647,39 @@
+ 
+ VMMR3DECL(int)              CPUMR3MsrRangesInsert(PVM pVM, PCCPUMMSRRANGE pNewRange);
+ 
++/**
++ * CPUM MSR read handler.
++ *
++ * @returns VBox status code.
++ * @retval VINF_CPUM_MSR_READ_DO_DEFAULT when the internal MSR read handler should be called.
++ *
++ * @param   pVM                 Pointer to the cross context VM structure.
++ * @param   idMsr               The MSR to read.
++ * @param   pu64Val             Where to store the value on return.
++ * @param   pvUser              Opaque user data passed during registration.
++ */
++typedef DECLCALLBACKTYPE(VBOXSTRICTRC, FNCPUMMSRREAD,(PVM pVM, uint32_t idMsr, uint64_t *pu64Val, void *pvUser));
++/** Pointer to a FNCPUMMSRREAD. */
++typedef FNCPUMMSRREAD *PFNCPUMMSRREAD;
++
++/**
++ * CPUM MSR write handler.
++ *
++ * @returns VBox status code.
++ * @retval VINF_CPUM_MSR_WRITE_DO_DEFAULT when the internal MSR write handler should be called.
++ *
++ * @param   pVM                 Pointer to the cross context VM structure.
++ * @param   idMsr               The MSR to write.
++ * @param   u64Val              The value to write.
++ * @param   pvUser              Opaque user data passed during registration.
++ */
++typedef DECLCALLBACKTYPE(VBOXSTRICTRC, FNCPUMMSRWRITE,(PVM pVM, uint32_t idMsr, uint64_t u64Val, void *pvUser));
++/** Pointer to a FNCPUMMSRWRITE. */
++typedef FNCPUMMSRWRITE *PFNCPUMMSRWRITE;
++
++VMMR3DECL(int)              CPUMR3MsrRwInterceptSet(PVM pVM, PFNCPUMMSRREAD pfnMsrRead, PFNCPUMMSRWRITE pfnMsrWrite,
++                                                    void *pvUser);
++
+ /** @} */
+ #endif /* IN_RING3 */
+ 
 Index: src/VBox/Devices/Misc/DevIce.cpp
 ===================================================================
 --- src/VBox/Devices/Misc/DevIce.cpp	(nicht existent)
 +++ src/VBox/Devices/Misc/DevIce.cpp	(Arbeitskopie)
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,609 @@
 +/* $Id$ */
 +/** @file
 + * ICE - In-Circuit Emulator device for hypervisor assisted x86 firmware development
@@ -175,6 +241,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +#include <VBox/vmm/pdmdev.h>
 +#include <VBox/vmm/pdmifs.h>
 +#include <VBox/vmm/pdmiceifs.h>
++#include <VBox/vmm/cpum.h>
 +#include <VBox/log.h>
 +#include <iprt/assert.h>
 +#include <iprt/file.h>
@@ -182,6 +249,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +#include <iprt/mem.h>
 +#include <iprt/path.h>
 +#include <iprt/uuid.h>
++#include <iprt/x86.h>
 +
 +#include "VBoxDD.h"
 +
@@ -290,7 +358,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +        *pu32 = UINT32_C(0xffffffff);
 +
 +    LogFlowFunc(("ICE: I/O port read at %RTiop %zu -> %Rrc (%#x)\n", pIoPortMapping->IoPortBase + offPort, cb, rc, *pu32));
-+    return VINF_SUCCESS;
++    return rc;
 +}
 +
 +
@@ -304,7 +372,7 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +        rc = pThis->pDrvIce->pfnIoPortWrite(pThis->pDrvIce, pIoPortMapping->IoPortBase + offPort, cb, u32);
 +
 +    LogFlowFunc(("I/O port write at %RTiop %zu %#x -> %Rrc\n", pIoPortMapping->IoPortBase + offPort, cb, u32, rc));
-+    return VINF_SUCCESS;
++    return rc;
 +}
 +
 +
@@ -349,6 +417,43 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +#endif
 +
 +    return rc;
++}
++
++
++/**
++ * @callback_method_impl{FNCPUMMSRREAD, ICE MSR read}
++ */
++static DECLCALLBACK(VBOXSTRICTRC) iceR3MsrRead(PVM pVM, uint32_t idMsr, uint64_t *pu64Val, void *pvUser)
++{
++    RT_NOREF(pVM);
++
++    int rc = VINF_CPUM_MSR_READ_DO_DEFAULT;
++    PICE pThis = (PICE)pvUser;
++
++    if (pThis->pDrvIce->pfnMsrRead)
++        rc = pThis->pDrvIce->pfnMsrRead(pThis->pDrvIce, idMsr, pu64Val);
++    if (RT_SUCCESS(rc) && idMsr == MSR_IA32_APICBASE)
++        rc = VINF_CPUM_MSR_READ_DO_DEFAULT;
++    return rc;
++}
++
++
++/**
++ * @callback_method_impl{FNCPUMMSRWRITE, ICE MSR write}
++ */
++static DECLCALLBACK(VBOXSTRICTRC) iceR3MsrWrite(PVM pVM, uint32_t idMsr, uint64_t u64Val, void *pvUser)
++{
++    RT_NOREF(pVM);
++
++    int rc = VINF_CPUM_MSR_WRITE_DO_DEFAULT;
++    PICE pThis = (PICE)pvUser;
++
++    if (pThis->pDrvIce->pfnMsrWrite)
++        rc = pThis->pDrvIce->pfnMsrWrite(pThis->pDrvIce, idMsr, u64Val);
++    if (RT_SUCCESS(rc) && idMsr == MSR_IA32_APICBASE)
++        rc = VINF_CPUM_MSR_WRITE_DO_DEFAULT;
++    return rc;
++
 +}
 +
 +
@@ -619,6 +724,14 @@ Index: src/VBox/Devices/Misc/DevIce.cpp
 +            AssertLogRelMsgFailed(("Configuration error: instance %d has no ICE interface!\n"));
 +            return VERR_PDM_MISSING_INTERFACE;
 +        }
++
++        /* Register the MSR intercetps if the driver below exposes the MSR read/write functionality. */
++        if (pThis->pDrvIce->pfnMsrRead || pThis->pDrvIce->pfnMsrWrite)
++        {
++            PVM pVM = PDMDevHlpGetVM(pDevIns);
++            rc = CPUMR3MsrRwInterceptSet(pVM, iceR3MsrRead, iceR3MsrWrite, pThis);
++            AssertMsgRC(rc, ("Configuration error: Setting the MSR read/write intercepts failed! rc=%Rrc\n", rc));
++        }
 +    }
 +    else if (rc == VERR_PDM_NO_ATTACHED_DRIVER)
 +    {
@@ -731,7 +844,7 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 ===================================================================
 --- src/VBox/Devices/Misc/DrvSerialIce.cpp	(nicht existent)
 +++ src/VBox/Devices/Misc/DrvSerialIce.cpp	(Arbeitskopie)
-@@ -0,0 +1,707 @@
+@@ -0,0 +1,931 @@
 +/* $Id$ */
 +/** @file
 + * Driver for the ICE device speaking the serialICE (https://serialice.com) protocol.
@@ -830,6 +943,124 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +
 +
 +static const uint8_t s_abHexToChr[16] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
++
++
++/**
++ * Converts a hex character to the appropriate nibble.
++ *
++ * @returns Nibble of the character.
++ * @param   bVal                    The value to convert.
++ */
++static inline uint8_t drvSerialIceHexToNibble(uint8_t bVal)
++{
++    if (bVal >= '0' && bVal <= '9')
++        return bVal - '0';
++    else if (bVal >= 'a' && bVal <= 'f')
++        return bVal - 'a' + 10;
++    else if (bVal >= 'A' && bVal <= 'F')
++        return bVal - 'A' + 10;
++
++    return 0xff;
++}
++
++
++/**
++ * Parse a ASCII 32bit value hexadecimal value and return the binary representation.
++ *
++ * @returns VBox status code.
++ * @param   pbSrc                   The data to parse.
++ * @param   pu32Val                 Where to return the value on success.
++ */
++static int drvSerialIceParseU32(uint8_t *pbSrc, uint32_t *pu32Val)
++{
++    int rc = VINF_SUCCESS;
++    *pu32Val = 0;
++
++    const uint8_t *pbData = &pbSrc[(sizeof(uint32_t) * 2) - 2];
++    for (uint32_t i = 0; i < sizeof(uint32_t) && RT_SUCCESS(rc); i++)
++    {
++        *pu32Val <<= 8;
++        uint8_t bNbH = drvSerialIceHexToNibble(pbData[0]);
++        uint8_t bNbL = drvSerialIceHexToNibble(pbData[1]);
++        if (bNbH != 0xff && bNbL != 0xff)
++            *pu32Val |= (bNbH << 4) | bNbL;
++        else
++            rc = VERR_NET_PROTOCOL_ERROR;
++    }
++
++    return rc;
++}
++
++
++/**
++ * Parse a ASCII 16bit value hexadecimal value and return the binary representation.
++ *
++ * @returns VBox status code.
++ * @param   pbSrc                   The data to parse.
++ * @param   pu16Val                 Where to return the value on success.
++ */
++static int drvSerialIceParseU16(uint8_t *pbSrc, uint16_t *pu16Val)
++{
++    int rc = VINF_SUCCESS;
++    *pu16Val = 0;
++
++    const uint8_t *pbData = &pbSrc[(sizeof(uint16_t) * 2) - 2];
++    for (uint32_t i = 0; i < sizeof(uint16_t) && RT_SUCCESS(rc); i++)
++    {
++        *pu16Val <<= 8;
++        uint8_t bNbH = drvSerialIceHexToNibble(pbData[0]);
++        uint8_t bNbL = drvSerialIceHexToNibble(pbData[1]);
++        if (bNbH != 0xff && bNbL != 0xff)
++            *pu16Val |= (bNbH << 4) | bNbL;
++        else
++            rc = VERR_NET_PROTOCOL_ERROR;
++    }
++
++    return rc;
++}
++
++
++/**
++ * Parse a ASCII 8bit value hexadecimal value and return the binary representation.
++ *
++ * @returns VBox status code.
++ * @param   pbSrc                   The data to parse.
++ * @param   pu8Val                  Where to return the value on success.
++ */
++static int drvSerialIceParseU8(uint8_t *pbSrc, uint8_t *pu8Val)
++{
++    int rc = VINF_SUCCESS;
++    *pu8Val = 0;
++
++    uint8_t bNbH = drvSerialIceHexToNibble(pbSrc[0]);
++    uint8_t bNbL = drvSerialIceHexToNibble(pbSrc[1]);
++    if (bNbH != 0xff && bNbL != 0xff)
++        *pu8Val |= (bNbH << 4) | bNbL;
++    else
++        rc = VERR_NET_PROTOCOL_ERROR;
++
++    return rc;
++}
++
++
++/**
++ * Encodes a given 32bit binary as a hexadecimal ASCII number.
++ *
++ * @returns nothing.
++ * @param   pbDst                   Where to store the encoded number.
++ * @param   u32Val                  The value to encode.
++ */
++static void drvSerialIceEncodeU32(uint8_t *pbDst, uint32_t u32Val)
++{
++    uint8_t *pbCur = pbDst + sizeof(uint32_t) * 2 - 1;
++
++    for (uint32_t i = 0; i < sizeof(uint32_t); i++)
++    {
++        *pbCur-- = s_abHexToChr[u32Val & 0xf];
++        *pbCur-- = s_abHexToChr[(u32Val >> 4) & 0xf];
++        u32Val >>= 8;
++    }
++}
 +
 +
 +/**
@@ -1103,28 +1334,45 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +                else
 +                {
 +                    /* Read the remaining data, at most 8 bytes for 32bit value. */
-+                    char abRecv[9] = { 0 };
++                    uint8_t abRecv[9] = { 0 };
 +                    abRecv[0] = bRead;
 +                    cbRecv--;
 +
 +                    rc = RTTcpRead(pThis->hTcpSock, &abRecv[1], cbRecv, NULL /*pcbRead*/);
 +                    if (RT_SUCCESS(rc))
 +                    {
-+                        const char *pbData = &abRecv[(cb * 2) - 2];
-+                        for (uint32_t i = 0; i < cb && RT_SUCCESS(rc); i++)
++                        switch (cb)
 +                        {
-+                            uint8_t bVal = 0;
-+                            rc = RTStrConvertHexBytes(pbData, &bVal, 1, 0 /*fFlags*/);
-+                            if (rc == VWRN_TRAILING_CHARS)
-+                                rc = VINF_SUCCESS;
-+
-+                            *pu32 <<= 8;
-+                            *pu32 |= bVal;
-+                            pbData -= 2;
++                            case 1:
++                            {
++                                uint8_t bVal = 0;
++                                rc = drvSerialIceParseU8(&abRecv[0], &bVal);
++                                *pu32 = bVal;
++                                break;
++                            }
++                            case 2:
++                            {
++                                uint16_t u16Val = 0;
++                                rc = drvSerialIceParseU16(&abRecv[0], &u16Val);
++                                *pu32 = u16Val;
++                                break;
++                            }
++                            case 4:
++                            {
++                                uint32_t u32Val = 0;
++                                rc = drvSerialIceParseU32(&abRecv[0], &u32Val);
++                                *pu32 = u32Val;
++                                break;
++                            }
++                            default:
++                                AssertMsgFailed(("Invalid size value %zu!\n", cb));
++                                break;
 +                        }
 +
-+                        if (RT_SUCCESS(rc))
-+                            rc = drvSerialIceWaitForCmdReadiness(pThis);
++                        int rc2 = drvSerialIceWaitForCmdReadiness(pThis);
++                        if (   RT_SUCCESS(rc)
++                            && RT_FAILURE(rc2))
++                            rc = rc2;
 +                    }
 +
 +                    break;
@@ -1260,6 +1508,93 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +}
 +
 +
++static DECLCALLBACK(int) drvSerialIceMsrRead(PPDMIICE pInterface, uint32_t idMsr, uint64_t *pu64Val)
++{
++    LogFlowFunc(("pInterface=%#p\n", pInterface));
++    PDRVSERIALICE pThis = RT_FROM_MEMBER(pInterface, DRVSERIALICE, IIce);
++
++    /* The command looks like *rc<idMsr>.<idKey>, so *rqc0000001b.9c5a203a for example */
++    uint8_t abMsrRdCmd[] = { '*', 'r', 'c', 0, 0, 0, 0, 0, 0, 0, 0, '.', 0, 0, 0, 0, 0, 0, 0, 0 };
++
++    drvSerialIceEncodeU32(&abMsrRdCmd[3], idMsr);
++    drvSerialIceEncodeU32(&abMsrRdCmd[12], 0x9c5a203a);
++
++    int rc = RTTcpWrite(pThis->hTcpSock, &abMsrRdCmd[0], sizeof(abMsrRdCmd));
++    if (RT_SUCCESS(rc))
++    {
++        /* Wait for the reply. */
++        for (;;)
++        {
++            /* Skipy any spaces and newlines which might still be in the buffer. */
++            uint8_t bRead = 0;
++            rc = RTTcpRead(pThis->hTcpSock, &bRead, sizeof(bRead), NULL /*pcbRead*/);
++            if (RT_SUCCESS(rc))
++            {
++                if (   bRead == ' '
++                    || bRead == '\n'
++                    || bRead == '\r')
++                    continue;
++                else
++                {
++                    /* Read the remaining data, exactly 17 bytes. */
++                    uint8_t abRecv[17] = { 0 };
++                    abRecv[0] = bRead;
++
++                    rc = RTTcpRead(pThis->hTcpSock, &abRecv[1], sizeof(abRecv) - 1, NULL /*pcbRead*/);
++                    if (RT_SUCCESS(rc))
++                    {
++                        if (abRecv[8] == '.') /* High and low part are separated by a dot */
++                        {
++                            uint32_t u32ValHigh = 0;
++                            uint32_t u32ValLow = 0;
++                            rc = drvSerialIceParseU32(&abRecv[0], &u32ValHigh);
++                            if (RT_SUCCESS(rc))
++                                rc = drvSerialIceParseU32(&abRecv[9], &u32ValLow);
++                            if (RT_SUCCESS(rc))
++                                *pu64Val = ((uint64_t)u32ValHigh) << 32 | u32ValLow;
++                        }
++                        else
++                            rc = VERR_NET_PROTOCOL_ERROR;
++
++                        if (RT_SUCCESS(rc))
++                            rc = drvSerialIceWaitForCmdReadiness(pThis);
++                    }
++
++                    break;
++                }
++            }
++            else
++                break;
++        }
++    }
++
++    return rc;
++}
++
++
++static DECLCALLBACK(int) drvSerialIceMsrWrite(PPDMIICE pInterface, uint32_t idMsr, uint64_t u64Val)
++{
++    LogFlowFunc(("pInterface=%#p\n", pInterface));
++    PDRVSERIALICE pThis = RT_FROM_MEMBER(pInterface, DRVSERIALICE, IIce);
++
++    /* The command looks like *wc<idMsr>.<idKey>=<edx>.<eax>, so *wc0000001b.9c5a203a=00000000.fee00100 for example */
++    uint8_t abMsrWrCmd[] = { '*', 'w', 'c', 0, 0, 0, 0, 0, 0, 0, 0, '.', 0, 0, 0, 0, 0, 0, 0, 0, '=', 0, 0, 0, 0, 0, 0, 0, 0, '.', 0, 0, 0, 0, 0, 0, 0, 0 };
++
++    drvSerialIceEncodeU32(&abMsrWrCmd[3], idMsr);
++    drvSerialIceEncodeU32(&abMsrWrCmd[12], 0x9c5a203a);
++
++    /* The value split into two 32bit values. */
++    drvSerialIceEncodeU32(&abMsrWrCmd[21], (uint32_t)(u64Val >> 32));
++    drvSerialIceEncodeU32(&abMsrWrCmd[30], (uint32_t)u64Val);
++
++    int rc = RTTcpWrite(pThis->hTcpSock, &abMsrWrCmd[0], sizeof(abMsrWrCmd));
++    if (RT_SUCCESS(rc))
++        rc = drvSerialIceWaitForCmdReadiness(pThis);
++
++    return rc;
++}
++
++
 +/**
 + * Destruct a TCP socket stream driver instance.
 + *
@@ -1314,6 +1649,8 @@ Index: src/VBox/Devices/Misc/DrvSerialIce.cpp
 +    pThis->IIce.pfnIoPortWrite                   = drvSerialIceIoPortWrite;
 +    pThis->IIce.pfnMemRead                       = drvSerialIceMemRead;
 +    pThis->IIce.pfnMemWrite                      = drvSerialIceMemWrite;
++    pThis->IIce.pfnMsrRead                       = drvSerialIceMsrRead;
++    pThis->IIce.pfnMsrWrite                      = drvSerialIceMsrWrite;
 +
 +    /*
 +     * Validate and read the configuration.
@@ -1520,3 +1857,219 @@ Index: src/VBox/Devices/Makefile.kmk
   ifn1of ($(KBUILD_TARGET), os2)
    VBoxDD_SOURCES += Storage/DrvHostBase.cpp
   endif
+Index: src/VBox/VMM/VMMR3/CPUMR3Db.cpp
+===================================================================
+--- src/VBox/VMM/VMMR3/CPUMR3Db.cpp	(Revision 139592)
++++ src/VBox/VMM/VMMR3/CPUMR3Db.cpp	(Arbeitskopie)
+@@ -1097,6 +1097,29 @@
+ 
+ 
+ /**
++ * Sets handlers to intercept MSR reads and writes made from the guest (R3 only).
++ *
++ * @returns VBox status code.
++ * @param   pVM                 The cross context VM structure.
++ * @param   pfnMsrRead          The MSR read callback.
++ * @param   pfnMsrWrite         The MSR write callback.
++ * @param   pvUser              Opque user data to pass to the callbacks.
++ */
++VMMR3DECL(int) CPUMR3MsrRwInterceptSet(PVM pVM, PFNCPUMMSRREAD pfnMsrRead, PFNCPUMMSRWRITE pfnMsrWrite, void *pvUser)
++{
++    AssertPtrReturn(pVM, VERR_INVALID_PARAMETER);
++    AssertPtrReturn(pfnMsrRead, VERR_INVALID_PARAMETER);
++    AssertPtrReturn(pfnMsrWrite, VERR_INVALID_PARAMETER);
++
++    pVM->cpum.s.pfnMsrReadR3      = pfnMsrRead;
++    pVM->cpum.s.pfnMsrWriteR3     = pfnMsrWrite;
++    pVM->cpum.s.pvMsrRwUserR3     = pvUser;
++    pVM->cpum.s.fMsrInterceptsSet = true;
++    return VINF_SUCCESS;
++}
++
++
++/**
+  * Register statistics for the MSRs.
+  *
+  * This must not be called before the MSRs have been finalized and moved to the
+Index: src/VBox/VMM/VMMAll/CPUMAllMsrs.cpp
+===================================================================
+--- src/VBox/VMM/VMMAll/CPUMAllMsrs.cpp	(Revision 139592)
++++ src/VBox/VMM/VMMAll/CPUMAllMsrs.cpp	(Arbeitskopie)
+@@ -5568,11 +5568,8 @@
+ 
+ 
+ /**
+- * Query a guest MSR.
++ * Query a guest MSR - worker for CPUMQueryGuestMsr().
+  *
+- * The caller is responsible for checking privilege if the call is the result of
+- * a RDMSR instruction.  We'll do the rest.
+- *
+  * @retval  VINF_SUCCESS on success.
+  * @retval  VINF_CPUM_R3_MSR_READ if the MSR read could not be serviced in the
+  *          current context (raw-mode or ring-0).
+@@ -5581,11 +5578,8 @@
+  * @param   pVCpu               The cross context virtual CPU structure.
+  * @param   idMsr               The MSR.
+  * @param   puValue             Where to return the value.
+- *
+- * @remarks This will always return the right values, even when we're in the
+- *          recompiler.
+  */
+-VMMDECL(VBOXSTRICTRC) CPUMQueryGuestMsr(PVMCPUCC pVCpu, uint32_t idMsr, uint64_t *puValue)
++static VBOXSTRICTRC cpumQueryGuestMsrWorker(PVMCPUCC pVCpu, uint32_t idMsr, uint64_t *puValue)
+ {
+     *puValue = 0;
+ 
+@@ -5636,11 +5630,8 @@
+ 
+ 
+ /**
+- * Writes to a guest MSR.
++ * Writes to a guest MSR - worker for CPUMSetGuestMsr().
+  *
+- * The caller is responsible for checking privilege if the call is the result of
+- * a WRMSR instruction.  We'll do the rest.
+- *
+  * @retval  VINF_SUCCESS on success.
+  * @retval  VINF_CPUM_R3_MSR_WRITE if the MSR write could not be serviced in the
+  *          current context (raw-mode or ring-0).
+@@ -5650,16 +5641,8 @@
+  * @param   pVCpu       The cross context virtual CPU structure.
+  * @param   idMsr       The MSR id.
+  * @param   uValue      The value to set.
+- *
+- * @remarks Everyone changing MSR values, including the recompiler, shall do it
+- *          by calling this method.  This makes sure we have current values and
+- *          that we trigger all the right actions when something changes.
+- *
+- *          For performance reasons, this actually isn't entirely true for some
+- *          MSRs when in HM mode.  The code here and in HM must be aware of
+- *          this.
+  */
+-VMMDECL(VBOXSTRICTRC) CPUMSetGuestMsr(PVMCPUCC pVCpu, uint32_t idMsr, uint64_t uValue)
++static VBOXSTRICTRC cpumSetGuestMsrWorker(PVMCPUCC pVCpu, uint32_t idMsr, uint64_t uValue)
+ {
+     VBOXSTRICTRC    rcStrict;
+     PVM             pVM    = pVCpu->CTX_SUFF(pVM);
+@@ -5726,6 +5709,88 @@
+ }
+ 
+ 
++/**
++ * Query a guest MSR.
++ *
++ * The caller is responsible for checking privilege if the call is the result of
++ * a RDMSR instruction.  We'll do the rest.
++ *
++ * @retval  VINF_SUCCESS on success.
++ * @retval  VINF_CPUM_R3_MSR_READ if the MSR read could not be serviced in the
++ *          current context (raw-mode or ring-0).
++ * @retval  VERR_CPUM_RAISE_GP_0 on failure (invalid MSR), the caller is
++ *          expected to take the appropriate actions. @a *puValue is set to 0.
++ * @param   pVCpu               The cross context virtual CPU structure.
++ * @param   idMsr               The MSR.
++ * @param   puValue             Where to return the value.
++ *
++ * @remarks This will always return the right values, even when we're in the
++ *          recompiler.
++ */
++VMMDECL(VBOXSTRICTRC) CPUMQueryGuestMsr(PVMCPUCC pVCpu, uint32_t idMsr, uint64_t *puValue)
++{
++    PVM pVM = pVCpu->CTX_SUFF(pVM);
++
++    if (!pVM->cpum.s.fMsrInterceptsSet)
++        return cpumQueryGuestMsrWorker(pVCpu, idMsr, puValue);
++
++#ifndef IN_RING3
++    return VINF_CPUM_R3_MSR_READ;
++#else
++    *puValue = 0;
++
++    VBOXSTRICTRC rcStrict = pVM->cpum.s.pfnMsrReadR3(pVM, idMsr, puValue, pVM->cpum.s.pvMsrRwUserR3);
++    if (rcStrict == VINF_CPUM_MSR_READ_DO_DEFAULT)
++        rcStrict = cpumQueryGuestMsrWorker(pVCpu, idMsr, puValue);
++
++    return rcStrict;
++#endif
++}
++
++
++/**
++ * Writes to a guest MSR.
++ *
++ * The caller is responsible for checking privilege if the call is the result of
++ * a WRMSR instruction.  We'll do the rest.
++ *
++ * @retval  VINF_SUCCESS on success.
++ * @retval  VINF_CPUM_R3_MSR_WRITE if the MSR write could not be serviced in the
++ *          current context (raw-mode or ring-0).
++ * @retval  VERR_CPUM_RAISE_GP_0 on failure, the caller is expected to take the
++ *          appropriate actions.
++ *
++ * @param   pVCpu       The cross context virtual CPU structure.
++ * @param   idMsr       The MSR id.
++ * @param   uValue      The value to set.
++ *
++ * @remarks Everyone changing MSR values, including the recompiler, shall do it
++ *          by calling this method.  This makes sure we have current values and
++ *          that we trigger all the right actions when something changes.
++ *
++ *          For performance reasons, this actually isn't entirely true for some
++ *          MSRs when in HM mode.  The code here and in HM must be aware of
++ *          this.
++ */
++VMMDECL(VBOXSTRICTRC) CPUMSetGuestMsr(PVMCPUCC pVCpu, uint32_t idMsr, uint64_t uValue)
++{
++    PVM pVM = pVCpu->CTX_SUFF(pVM);
++
++    if (!pVM->cpum.s.fMsrInterceptsSet)
++        return cpumSetGuestMsrWorker(pVCpu, idMsr, uValue);
++
++#ifndef IN_RING3
++    return VINF_CPUM_R3_MSR_WRITE;
++#else
++    VBOXSTRICTRC rcStrict = pVM->cpum.s.pfnMsrWriteR3(pVM, idMsr, uValue, pVM->cpum.s.pvMsrRwUserR3);
++    if (rcStrict == VINF_CPUM_MSR_WRITE_DO_DEFAULT)
++        rcStrict = cpumSetGuestMsrWorker(pVCpu, idMsr, uValue);
++
++    return rcStrict;
++#endif
++}
++
++
+ #if defined(VBOX_STRICT) && defined(IN_RING3)
+ /**
+  * Performs some checks on the static data related to MSRs.
+Index: src/VBox/VMM/include/CPUMInternal.h
+===================================================================
+--- src/VBox/VMM/include/CPUMInternal.h	(Revision 139592)
++++ src/VBox/VMM/include/CPUMInternal.h	(Arbeitskopie)
+@@ -365,7 +365,9 @@
+     uint32_t                fHostMxCsrMask;
+     /** Nested VMX: Whether to expose VMX-preemption timer to the guest. */
+     bool                    fNestedVmxPreemptTimer;
+-    uint8_t                 abPadding1[3];
++    /** Flag whether the MSR intercepts are set and all MSR accesses should be deferred to it. */
++    bool                    fMsrInterceptsSet;
++    uint8_t                 abPadding1[2];
+ 
+     /** Align to 64-byte boundary. */
+     uint8_t                 abPadding2[20+4];
+@@ -396,6 +398,16 @@
+     STAMCOUNTER             cMsrReadsRaiseGp;
+     STAMCOUNTER             cMsrReadsUnknown;
+     /** @} */
++
++    /** @name MSR intercepts.
++     * @{ */
++    /* MSR read intercept callback. */
++    R3PTRTYPE(PFNCPUMMSRREAD)  pfnMsrReadR3;
++    /* MSR write intercept callback. */
++    R3PTRTYPE(PFNCPUMMSRWRITE) pfnMsrWriteR3;
++    /** Opaque user data to pass to the intercept callbacks. */
++    R3PTRTYPE(void *)          pvMsrRwUserR3;
++    /** @} */
+ } CPUM;
+ #ifndef VBOX_FOR_DTRACE_LIB
+ AssertCompileMemberOffset(CPUM, HostFeatures, 64);
